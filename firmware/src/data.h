@@ -6,6 +6,7 @@ struct UsageData {
     int session_reset_mins;  // minutes until reset
     float weekly_pct;        // 7-day utilization (Pro/Max only; 0 for Enterprise)
     float surplus_pct;       // 7-day rolling weekly budget
+    bool has_surplus;        // daemon sent "sp"; false hides the pace label
     int weekly_reset_mins;   // minutes until weekly reset (Pro/Max only)
     char status[16];         // "allowed", "limited", etc.
     bool chime;              // play the session-reset chime; false unless daemon opts in
