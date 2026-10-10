@@ -23,6 +23,10 @@ from pathlib import Path
 import httpx
 from bleak import BleakClient
 from bleak.exc import BleakError
+try:
+    from daemon.pace import weekly_surplus_pct
+except ImportError:  # run as a script from daemon/
+    from pace import weekly_surplus_pct
 
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
@@ -443,14 +447,11 @@ async def poll_api(token: str) -> dict | None:
     # spending-limit model reported via overage-utilization.
     if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
         weekly_pct = pct(hdr("anthropic-ratelimit-unified-7d-utilization"))
-        day_of_week = min(datetime.datetime.now().isoweekday(), 5)
-        surplus_pct = (day_of_week * 20.0) - weekly_pct
         payload = {
             "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
             "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
             "w": weekly_pct,
             "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-            "sp": round(surplus_pct, 1),
             "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
             "ok": True,
@@ -773,10 +774,9 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 payload, dead = await poll_active()
                 if payload is not None:
                     if "w" in payload:
-                        day_of_week = min(datetime.datetime.now().isoweekday(), 5)
-                        weekly_pct = payload.get("w", 0)
-                        surplus_pct = (day_of_week * 20.0) - weekly_pct
-                        payload["sp"] = round(surplus_pct, 1)
+                        sp = weekly_surplus_pct(payload["w"], payload.get("wr"))
+                        if sp is not None:
+                            payload["sp"] = sp
                     if await session.write_payload(payload):
                         last_poll = time.time()
                         used_successfully = True
