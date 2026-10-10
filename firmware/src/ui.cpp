@@ -670,8 +670,19 @@ void ui_update(const UsageData* data) {
         lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
         lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
         lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
+        
+        // Format reset countdown time (e.g. "Resets in 2d 4h")
         format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
-        lv_label_set_text(lbl_weekly_reset, buf);
+        
+        // Append colored surplus text:
+        char full_buf[96];
+        if (data->surplus_pct >= 0) {
+            snprintf(full_buf, sizeof(full_buf), "%s  |  #788c5d +%.0f%% Ahead#", buf, data->surplus_pct);
+        } else {
+            snprintf(full_buf, sizeof(full_buf), "%s  |  #c0392b %.0f%% Behind#", buf, data->surplus_pct);
+        }
+        
+        lv_label_set_text(lbl_weekly_reset, full_buf);
     }
 }
 

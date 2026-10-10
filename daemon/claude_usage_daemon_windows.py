@@ -223,11 +223,15 @@ async def poll_api(token: str) -> dict | None:
             return 0
 
     if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
+        weekly_pct = pct(hdr("anthropic-ratelimit-unified-7d-utilization"))
+        day_of_week = min(datetime.datetime.now().isoweekday(), 5)
+        surplus_pct = (day_of_week * 20.0) - weekly_pct
         payload = {
             "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
             "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-            "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+            "w": weekly_pct,
             "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+            "sp": round(surplus_pct, 1),
             "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
             "ok": True,
@@ -643,6 +647,11 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                         if tray_state:
                             tray_state.set_error("token expired — run claude login")
                     if payload is not None:
+                        if "w" in payload:
+                            day_of_week = min(datetime.datetime.now().isoweekday(), 5)
+                            weekly_pct = payload.get("w", 0)
+                            surplus_pct = (day_of_week * 20.0) - weekly_pct
+                            payload["sp"] = round(surplus_pct, 1)
                         if await session.write_payload(payload):
                             last_poll = time.time()
                             used_successfully = True
