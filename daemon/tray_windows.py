@@ -39,7 +39,12 @@ if _REPO_ROOT not in sys.path:
 _VENV_SITE = os.path.join(_REPO_ROOT, ".venv", "Lib", "site-packages")
 if os.path.isdir(_VENV_SITE):
     import site
+    # addsitedir APPENDS, so a stale copy in the base interpreter's
+    # site-packages (e.g. an old typing_extensions) would shadow the venv's
+    # and crash anyio on first use. Move the venv entries to the front.
+    _base_path = list(sys.path)
     site.addsitedir(_VENV_SITE)
+    sys.path[:] = [p for p in sys.path if p not in _base_path] + _base_path
 
 # ---------------------------------------------------------------------------
 # TrayState — thread-safe scalar bridge (loop -> tray)
