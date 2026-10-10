@@ -110,6 +110,7 @@ static bool parse_json(const char* json, UsageData* out) {
     out->session_reset_mins = doc["sr"] | -1;
     out->weekly_pct = doc["w"] | 0.0f;
     out->surplus_pct = doc["sp"] | doc["surplus"] | 0.0f;
+    out->has_surplus = !doc["sp"].isNull() || !doc["surplus"].isNull();   // old daemons omit it
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent

@@ -2,6 +2,7 @@
 #include "splash.h"
 #include <lvgl.h>
 #include <time.h>
+#include <math.h>
 #include "logo.h"
 #include "clawd_still.h"
 #include "icons.h"
@@ -209,6 +210,7 @@ static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
+static lv_obj_t* lbl_weekly_pace;   // "+83% ahead" between the weekly % and its pill
 static lv_obj_t* panel_session = nullptr;
 static lv_obj_t* panel_weekly = nullptr;
 // Enterprise-only widgets inside panel_session
@@ -529,6 +531,11 @@ static void init_usage_screen(lv_obj_t* scr) {
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
+    lbl_weekly_pace = lv_label_create(panel_weekly);
+    lv_label_set_text(lbl_weekly_pace, "");
+    lv_obj_set_style_text_font(lbl_weekly_pace, L.pace_font, 0);
+    lv_obj_add_flag(lbl_weekly_pace, LV_OBJ_FLAG_HIDDEN);
+
     build_pair_group(usage_container);
     build_idle_group(usage_container);
 
@@ -588,6 +595,43 @@ void ui_init(void) {
         lv_obj_del(battery_img);
         battery_img = nullptr;
     }
+}
+
+// Weekly pace sits on the weekly panel's top row, between the big percentage
+// and the pill. Only 480-wide panels fit the full text at every percentage, so
+// narrower ones fall back to the bare number, then hide it.
+static void update_weekly_pace(const UsageData* data) {
+    if (data->enterprise || !data->has_surplus) {
+        lv_obj_add_flag(lbl_weekly_pace, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    int sp = (int)lroundf(data->surplus_pct);
+    char brief[12], full[24];
+    snprintf(brief, sizeof(brief), "%+d%%", sp);
+    snprintf(full, sizeof(full), "%s %s", brief, sp >= 0 ? "ahead" : "behind");
+    lv_obj_set_style_text_color(lbl_weekly_pace, sp >= 0 ? COL_GREEN : COL_RED, 0);
+
+    lv_obj_update_layout(panel_weekly);   // current widths of the % label and pill
+    int32_t gap = L.pill_pad_x;
+    int32_t room = lv_obj_get_x(lbl_weekly_label)
+                 - (lv_obj_get_x(lbl_weekly_pct) + lv_obj_get_width(lbl_weekly_pct))
+                 - 2 * gap;
+    const char* text = nullptr;
+    lv_point_t sz;
+    lv_text_get_size(&sz, full, L.pace_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    if (sz.x <= room) {
+        text = full;
+    } else {
+        lv_text_get_size(&sz, brief, L.pace_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        if (sz.x <= room) text = brief;
+    }
+    if (!text) {
+        lv_obj_add_flag(lbl_weekly_pace, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_label_set_text(lbl_weekly_pace, text);
+    lv_obj_clear_flag(lbl_weekly_pace, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align_to(lbl_weekly_pace, lbl_weekly_label, LV_ALIGN_OUT_LEFT_MID, -gap, 0);
 }
 
 void ui_update(const UsageData* data) {
@@ -670,20 +714,10 @@ void ui_update(const UsageData* data) {
         lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
         lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
         lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
-        
-        // Format reset countdown time (e.g. "Resets in 2d 4h")
         format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
-        
-        // Append colored surplus text:
-        char full_buf[96];
-        if (data->surplus_pct >= 0) {
-            snprintf(full_buf, sizeof(full_buf), "%s  |  #788c5d +%.0f%% Ahead#", buf, data->surplus_pct);
-        } else {
-            snprintf(full_buf, sizeof(full_buf), "%s  |  #c0392b %.0f%% Behind#", buf, data->surplus_pct);
-        }
-        
-        lv_label_set_text(lbl_weekly_reset, full_buf);
+        lv_label_set_text(lbl_weekly_reset, buf);
     }
+    update_weekly_pace(data);
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
