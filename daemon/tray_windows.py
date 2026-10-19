@@ -133,9 +133,9 @@ def _acquire_single_instance():
     lock (the caller must then exit immediately, before touching BLE).
 
     Uses a named kernel mutex: Windows releases it automatically when the owning
-    process dies, so there is no stale-lock cleanup (unlike a pidfile). We never
-    CloseHandle it — the handle lives until process exit, which is precisely the
-    lock lifetime we want.
+    process dies, so there is no stale-lock cleanup (unlike a pidfile). The
+    handle lives until process exit, except on Restart, which closes it with
+    _release_single_instance() so the relaunched tray can take the lock.
 
     Off-Windows (Linux dev box / unit tests) this is a no-op that always
     succeeds — the tray only ever runs on Windows, and the dev box must stay
@@ -159,6 +159,42 @@ def _acquire_single_instance():
     if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
         return None  # another instance already holds it
     return handle
+
+
+def _release_single_instance(handle) -> None:
+    """Close the singleton mutex handle so a relaunched tray can acquire it.
+
+    The fail-open sentinel (object()) and the off-Windows no-op have nothing to close.
+    """
+    if sys.platform != "win32" or not isinstance(handle, int):
+        return
+    import ctypes
+    ctypes.WinDLL("kernel32").CloseHandle(handle)
+
+
+# DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the relaunched tray owns no
+# console and does not share this process's console group.
+_RELAUNCH_FLAGS = 0x00000008 | 0x00000200
+
+
+def _relaunch_tray(instance_lock) -> None:
+    """Release the singleton lock, then start a fresh tray with the autostart command.
+
+    Called after the icon has stopped and the daemon thread has disconnected, so
+    the new instance never overlaps this one on the lock or the BLE link. It is
+    started by this process, so it inherits this tray's environment and stays
+    outside any app container the original launch avoided.
+    """
+    import subprocess
+    import daemon.autostart_windows as autostart
+
+    _release_single_instance(instance_lock)
+    subprocess.Popen(
+        autostart._command(os.path.abspath(__file__)),
+        cwd=_REPO_ROOT,
+        creationflags=_RELAUNCH_FLAGS,
+        close_fds=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +234,8 @@ def main() -> None:
     # Set by the Quit handler so the supervisor below knows a clean stop was
     # requested and must NOT resurrect the loop.
     _quit_requested = threading.Event()
+    # Set by Restart: quit as usual, then relaunch once the icon has stopped.
+    _restart_requested = threading.Event()
 
     # --- background thread: asyncio loop (supervised, auto-restart on crash) ---
     def _run_daemon() -> None:
@@ -250,6 +288,10 @@ def main() -> None:
             daemon_thread.join(timeout=6.0)
         icon_ref.stop()
 
+    def _on_restart(icon_ref, item) -> None:
+        _restart_requested.set()
+        _on_quit(icon_ref, item)
+
     def _on_toggle(_icon_ref, _item) -> None:
         if autostart.is_enabled():
             autostart.disable()
@@ -265,6 +307,7 @@ def main() -> None:
         MenuItem(lambda _item: header_text(ts), None, enabled=False),
         # Start-at-login toggle: checked= is a CALLABLE for live query (Pitfall 6).
         MenuItem("Start at login", _on_toggle, checked=lambda _item: autostart.is_enabled()),
+        MenuItem("Restart", _on_restart),
         MenuItem("Quit", _on_quit),
     )
 
@@ -296,6 +339,10 @@ def main() -> None:
 
     # Blocks the main thread until icon.stop() is called from _on_quit.
     icon.run(setup=_refresh)
+
+    if _restart_requested.is_set():
+        daemon_log("Restart requested from tray menu; relaunching")
+        _relaunch_tray(_instance_lock)
 
 
 if __name__ == "__main__":
