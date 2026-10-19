@@ -180,8 +180,8 @@ _RELAUNCH_FLAGS = 0x00000008 | 0x00000200
 def _relaunch_tray(instance_lock) -> None:
     """Release the singleton lock, then start a fresh tray with the autostart command.
 
-    Called after the icon has stopped and the daemon thread has disconnected, so
-    the new instance never overlaps this one on the lock or the BLE link. It is
+    Called once the daemon thread has disconnected, so the new instance never
+    overlaps this one on the lock or the BLE link. It is
     started by this process, so it inherits this tray's environment and stays
     outside any app container the original launch avoided.
     """
@@ -195,6 +195,35 @@ def _relaunch_tray(instance_lock) -> None:
         creationflags=_RELAUNCH_FLAGS,
         close_fds=True,
     )
+
+
+# Seconds a stopped tray may take to leave pystray's message loop before it is
+# forced out. stop() alone waits up to SETUP_THREAD_TIMEOUT (5 s) on the setup
+# thread, so this leaves room for a normal exit.
+_STOP_GRACE_S = 15.0
+
+
+def _force_exit(icon_ref) -> None:
+    """Remove the tray icon and end the process without waiting on pystray."""
+    try:
+        icon_ref.visible = False
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def _arm_exit_watchdog(icon_ref) -> threading.Timer:
+    """End the process if the icon's message loop is still running after the grace period.
+
+    A Restart click on 2026-10-19 stopped the daemon and the setup thread, yet the
+    tray sat in pystray's GetMessage loop with its icon still showing, so nothing
+    after icon.run() ever ran. The timer is a daemon thread: a normal exit ends
+    the process before it fires.
+    """
+    timer = threading.Timer(_STOP_GRACE_S, _force_exit, args=(icon_ref,))
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +263,6 @@ def main() -> None:
     # Set by the Quit handler so the supervisor below knows a clean stop was
     # requested and must NOT resurrect the loop.
     _quit_requested = threading.Event()
-    # Set by Restart: quit as usual, then relaunch once the icon has stopped.
-    _restart_requested = threading.Event()
 
     # --- background thread: asyncio loop (supervised, auto-restart on crash) ---
     def _run_daemon() -> None:
@@ -282,15 +309,24 @@ def main() -> None:
         #
         # Set _quit_requested FIRST so the supervisor loop in _run_daemon never
         # resurrects the daemon after we signal stop (Quit must be final).
+        _stop_daemon()
+        _arm_exit_watchdog(icon_ref)
+        icon_ref.stop()
+
+    def _stop_daemon() -> None:
         _quit_requested.set()
         if ts.loop is not None and ts.stop_event is not None:
             ts.loop.call_soon_threadsafe(ts.stop_event.set)
             daemon_thread.join(timeout=6.0)
-        icon_ref.stop()
 
-    def _on_restart(icon_ref, item) -> None:
-        _restart_requested.set()
-        _on_quit(icon_ref, item)
+    def _on_restart(icon_ref, _item) -> None:
+        # Relaunch from inside the click handler, before stopping the icon: code
+        # after icon.run() never ran when pystray's loop failed to exit.
+        _stop_daemon()
+        daemon_log("Restart requested from tray menu; relaunching")
+        _relaunch_tray(_instance_lock)
+        _arm_exit_watchdog(icon_ref)
+        icon_ref.stop()
 
     def _on_toggle(_icon_ref, _item) -> None:
         if autostart.is_enabled():
@@ -339,10 +375,6 @@ def main() -> None:
 
     # Blocks the main thread until icon.stop() is called from _on_quit.
     icon.run(setup=_refresh)
-
-    if _restart_requested.is_set():
-        daemon_log("Restart requested from tray menu; relaunching")
-        _relaunch_tray(_instance_lock)
 
 
 if __name__ == "__main__":

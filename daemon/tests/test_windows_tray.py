@@ -377,3 +377,43 @@ def test_main_runs_in_background_thread_without_signal_error():
 
     assert not t.is_alive(), "daemon main() hung in background thread"
     assert not errors, f"main() raised in a background thread: {errors!r}"
+
+
+def test_force_exit_hides_icon_then_exits():
+    import daemon.tray_windows as tw
+
+    icon = MagicMock()
+    icon.visible = True
+    with patch.object(tw.os, "_exit") as hard_exit:
+        tw._force_exit(icon)
+    assert icon.visible is False
+    hard_exit.assert_called_once_with(0)
+
+
+def test_force_exit_still_exits_when_hiding_fails():
+    import daemon.tray_windows as tw
+
+    class _Icon:
+        @property
+        def visible(self):
+            return True
+
+        @visible.setter
+        def visible(self, _value):
+            raise OSError("Shell_NotifyIcon failed")
+
+    with patch.object(tw.os, "_exit") as hard_exit:
+        tw._force_exit(_Icon())
+    hard_exit.assert_called_once_with(0)
+
+
+def test_exit_watchdog_is_a_daemon_timer_on_the_grace_period():
+    import daemon.tray_windows as tw
+
+    icon = MagicMock()
+    with patch.object(tw, "_STOP_GRACE_S", 0.05), \
+         patch.object(tw, "_force_exit") as force_exit:
+        timer = tw._arm_exit_watchdog(icon)
+        assert timer.daemon
+        timer.join(timeout=2.0)
+    force_exit.assert_called_once_with(icon)
