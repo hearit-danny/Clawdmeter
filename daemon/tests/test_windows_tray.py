@@ -15,6 +15,7 @@ handlers with mocked icons without importing the GTK-less top-level pystray.
 Run: python -m pytest daemon/tests/test_windows_tray.py -x -q
 """
 import asyncio
+import sys
 import time
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
@@ -265,6 +266,51 @@ def test_single_instance_fails_open_on_null_handle():
         mock_sys.platform = "win32"
         result = _acquire_single_instance()
         assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Restart: release the singleton, then relaunch with the autostart command
+# ---------------------------------------------------------------------------
+
+def test_release_single_instance_ignores_sentinels():
+    """The fail-open sentinel and off-Windows no-op have no handle to close."""
+    from daemon.tray_windows import _release_single_instance
+    fake_ctypes = MagicMock()
+    with patch("daemon.tray_windows.sys") as mock_sys, \
+         patch.dict("sys.modules", {"ctypes": fake_ctypes}):
+        mock_sys.platform = "win32"
+        _release_single_instance(object())
+        _release_single_instance(None)
+    fake_ctypes.WinDLL.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real named mutex")
+def test_released_lock_can_be_taken_again():
+    """After release, a second acquire of the same name succeeds (what the relaunched tray does)."""
+    import daemon.tray_windows as tw
+    with patch.object(tw, "_SINGLETON_MUTEX_NAME", "Local\\Clawdmeter-tray-test-restart"):
+        # A second acquire while held is covered by the mocked tests above; doing
+        # it for real here would leave its handle open and keep the name alive.
+        first = tw._acquire_single_instance()
+        assert isinstance(first, int)
+        tw._release_single_instance(first)
+        again = tw._acquire_single_instance()
+        assert isinstance(again, int)
+        tw._release_single_instance(again)
+
+
+def test_relaunch_releases_lock_before_spawning_autostart_command():
+    import daemon.tray_windows as tw
+    order = []
+    with patch.object(tw, "_release_single_instance", side_effect=lambda h: order.append(("release", h))), \
+         patch("subprocess.Popen", side_effect=lambda cmd, **kw: order.append(("spawn", cmd, kw))):
+        tw._relaunch_tray(0x1234)
+    assert [step[0] for step in order] == ["release", "spawn"]
+    assert order[0][1] == 0x1234
+    _, cmd, kw = order[1]
+    assert cmd.endswith('tray_windows.py"') and 'pythonw.exe" ' in cmd
+    assert kw["creationflags"] == tw._RELAUNCH_FLAGS
+    assert kw["cwd"] == tw._REPO_ROOT
 
 
 # ---------------------------------------------------------------------------
