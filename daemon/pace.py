@@ -1,15 +1,21 @@
 """Weekly pace against a five-workday budget.
 
-The 7-day window is split into seven 24h slots that start at the window's
-start (reset time minus 7 days), so slot boundaries fall at the reset's time
-of day. The five slots that start Monday to Friday each earn 20% of the
-weekly budget, linearly across the slot; weekend slots earn nothing.
+Each Monday-to-Friday in the 7-day window earns 20% of the weekly budget,
+linearly across its working hours (WORKDAY_START to WORKDAY_END, local time).
+Outside working hours the expected value holds still until the next workday
+opens. A workday belongs to the window that contains its close, so when the
+reset falls inside working hours the window's first day starts at the reset
+and the sliver before the next reset counts toward the next window. Every
+window therefore holds exactly five 20% days.
 
 surplus = expected - used: positive means under budget, negative means over.
-With a Wednesday 08:00 reset, by Saturday the Wed/Thu/Fri slots have earned
-60%, so 17% used reads +43 and 78% used reads -18 until Monday 08:00.
+With a Wednesday 08:00 reset, Monday 16:00 expects 80% (Wed/Thu/Fri/Mon), so
+68% used reads +12 and stays there until Tuesday 07:30.
 """
 import datetime
+
+WORKDAY_START = datetime.time(7, 30)
+WORKDAY_END = datetime.time(16, 0)
 
 _DAY = datetime.timedelta(days=1)
 
@@ -17,10 +23,14 @@ _DAY = datetime.timedelta(days=1)
 def expected_weekly_pct(reset_at: datetime.datetime, now: datetime.datetime) -> float:
     start = reset_at - 7 * _DAY
     earned = 0.0
-    for i in range(7):
-        slot = start + i * _DAY
-        if slot.weekday() < 5:
-            earned += min(max((now - slot) / _DAY, 0.0), 1.0)
+    day = start.date()
+    while day <= reset_at.date():
+        opens = datetime.datetime.combine(day, WORKDAY_START)
+        closes = datetime.datetime.combine(day, WORKDAY_END)
+        if day.weekday() < 5 and start < closes <= reset_at:
+            opens = max(opens, start)
+            earned += min(max((now - opens) / (closes - opens), 0.0), 1.0)
+        day += _DAY
     return earned * 20.0
 
 
