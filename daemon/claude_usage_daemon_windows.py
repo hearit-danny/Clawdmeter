@@ -27,8 +27,10 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 try:
     from daemon.pace import weekly_surplus_pct
+    from daemon import machine_stats
 except ImportError:  # run as a script from daemon/
     from pace import weekly_surplus_pct
+    import machine_stats
 
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
@@ -44,6 +46,7 @@ ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning 
                            # N=2 would bust the 120s budget before reconnect even begins
 RECONNECT_BACKOFF_CAP = 8  # D-05: fast-reconnect cap (seconds); keeps stacked retries inside 120s SLA
                            # ~5–10s band per CONTEXT.md Claude's Discretion; 8 chosen as middle ground
+MAX_PAYLOAD_BYTES = 240    # NimBLE's preferred MTU is 255 and a write without response carries MTU - 3
 
 # Optional reset chime.
 # Optional clock display. 
@@ -375,10 +378,38 @@ async def acquire_target():
     return BLEDevice(address, DEVICE_NAME, None)
 
 
+def machine_extra(payload: dict, fields: dict, last_sent: dict | None) -> dict | None:
+    """Machine keys to add to this write, or None when nothing the device shows changed.
+
+    Rides on the usage writes that already go out; never a write of its own.
+    The rig list is cut from the end (down rigs sort last) until the whole
+    payload fits one write.
+    """
+    if not fields or fields == last_sent:
+        return None
+    extra = dict(fields)
+    extra["rg"] = list(fields.get("rg", []))
+
+    def size() -> int:
+        return len(json.dumps({**payload, **extra}, separators=(",", ":")))
+
+    while size() > MAX_PAYLOAD_BYTES and extra["rg"]:
+        extra["rg"].pop()
+    return extra if size() <= MAX_PAYLOAD_BYTES else None
+
+
+def _machine_fields() -> dict:
+    """Machine keys from the running sampler, or {} before its first sample."""
+    sampler = machine_stats.running_sampler()
+    return machine_stats.payload_fields(sampler.snapshot) if sampler else {}
+
+
 class Session:
-    def __init__(self, client: BleakClient) -> None:
+    def __init__(self, client: BleakClient, machine=_machine_fields) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        self._machine = machine
+        self._machine_sent: dict | None = None   # per link, so a reconnect resends
 
     def _on_refresh(self, _char, _data: bytearray) -> None:
         log("Refresh requested by device")
@@ -397,10 +428,16 @@ class Session:
             log(f"Refresh subscription unavailable: {e}")
 
     async def write_payload(self, payload: dict) -> bool:
+        fields = self._machine() if self._machine else {}
+        extra = machine_extra(payload, fields, self._machine_sent)
+        if extra:
+            payload = {**payload, **extra}
         data = json.dumps(payload, separators=(",", ":")).encode()
         log(f"Sending: {data.decode()}")
         try:
             await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            if extra:
+                self._machine_sent = fields
             return True
         except (BleakError, OSError) as e:
             # WinRT can raise a raw OSError/WinError (NOT wrapped as BleakError)
@@ -739,6 +776,8 @@ async def main(tray_state=None) -> None:
 
     log("=== Claude Usage Tracker Daemon (BLE, Windows) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
+    if sys.platform == "win32":
+        machine_stats.shared_sampler()   # CPU, RAM and rig keys for the machine screen
 
     # D-05: two distinct backoff regimes — slow-search (device absent) vs fast-reconnect (link dropped)
     search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
