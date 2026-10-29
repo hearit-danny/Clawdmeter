@@ -199,6 +199,8 @@ Right-click the tray icon for the menu:
 - **Status header** (non-clickable) — live status + last data sync time.
 - **Start at login** (checkable toggle) — enables or disables autostart at runtime.
   Reflects the current registry state each time the menu opens.
+- **Machine overlay** (checkable toggle) - shows or hides the desktop machine overlay
+  (see [Machine meter](#machine-meter)). Saved as `overlay = on|off` in the daemon config.
 - **Quit** — stops the daemon cleanly and exits with no lingering process. It releases the
   daemon's own data connection but does **not** drop the Windows Bluetooth pairing — the
   device stays connected to Windows and keeps showing your last-synced usage (point-in-time
@@ -219,6 +221,46 @@ credential paths (`%USERPROFILE%\.claude\.credentials.json` and fallbacks); BLE 
 the WinRT stack directly. Running `wsl --shutdown` does not affect the BLE link, and
 the daemon starts correctly even in a fresh Windows session where WSL has never been
 launched.
+
+---
+
+## Machine meter
+
+The daemon also reports this PC's CPU load, free RAM and which MNIIS rigs are up.
+
+- **On the device:** a third screen in the tap cycle (splash, usage, machine). CPU bar with
+  percent, RAM bar (used) with free GB, then one row per rig: solid green dot when all of
+  its ports listen, amber when some do, hollow ring when none do. Down rigs sort last, so
+  when there are more rigs than rows the last row reads `+N more`. Firmware without the
+  screen ignores the new keys; a daemon without them leaves the screen on "No Machine Data".
+- **On the desktop:** tray menu **Machine overlay**. A small click-through panel docked
+  bottom-right above the taskbar at 70% opacity: CPU and free RAM with two thin bars, and a
+  line like `inv1 up · main partial · 7 down`. It never takes focus and is not in Alt-Tab.
+
+How it is sampled (`daemon/machine_stats.py`, stdlib and ctypes only):
+
+- CPU from two `GetSystemTimes` reads 5 s apart; RAM from `GlobalMemoryStatusEx`.
+- Rigs every 60 s: the `stack.env` files `rigs.mjs` scans (the primary checkout's
+  worktrees via `.git/worktrees/*/gitdir`, plus `RiderProjects\*` and `C:\wt\*`), then one
+  non-blocking TCP connect per port to 127.0.0.1, all waited on in a single 50 ms select.
+- No docker, wsl.exe, WMI, PowerShell or subprocess. dockerd runs in the Ubuntu WSL distro
+  and any docker or wsl call boots the VM when it is stopped; a refused connect does not.
+- Listeners run only when a rounded value changed. The device keys (`cpu`, `rf`, `rp`,
+  `rg`) ride on the usage write the daemon already sends every 60 s, only when something
+  changed and always on the first write of a connection; there is no extra BLE write. The
+  rig list is trimmed so a payload stays within one 240-byte write. The overlay repaints
+  on the same change signal; it has no timer.
+
+Measured cost on this PC (2026-10-29, Python 3.12, 3840x1600 at 100%):
+
+| What | Number |
+|------|--------|
+| Sampler + overlay, isolated, 15 min | 0.054% of one core (0.064% minus a 0.010% idle-process control) |
+| Extra memory, isolated, beside the daemon's imports | sampler only: +1.3 MB working set, +1.1 MB private; with the overlay: +3.1 MB working set, +1.4 MB private (the overlay's share is mostly shared GDI and font DLL pages) |
+| Whole tray, 15 min idle at 30 min uptime, overlay on, vs the old code at the same uptime | 0.44% vs 0.45% of one core; 61.6 vs 63.4 MB working set; 43.7 vs 40.2 MB private |
+| One overlay repaint | 0.27 ms |
+| One rig probe of 30 ports | about 7 ms wall clock, bounded by the 50 ms timeout |
+| Device firmware | +160 B RAM, +2.2 KB flash |
 
 ---
 
