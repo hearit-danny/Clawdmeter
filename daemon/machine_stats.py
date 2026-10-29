@@ -313,7 +313,11 @@ class MachineSampler:
         return snap
 
     def _run(self) -> None:
-        self.tick()   # first CPU read is the baseline
+        # The first read is only a baseline; take the second after 1 s so the
+        # daemon's first write after connect (about 3 s in) already has a value.
+        self.tick()
+        if not self._stop.wait(min(1.0, self._sample_s)):
+            self.tick()
         while not self._stop.wait(self._sample_s):
             self.tick()
 
