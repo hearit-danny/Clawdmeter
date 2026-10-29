@@ -66,6 +66,9 @@ struct Layout {
     const lv_font_t* bt_device_font;
     const lv_font_t* bt_credit_1_font;
     const lv_font_t* bt_credit_2_font;
+
+    // Machine screen (CPU / RAM panels reuse the usage panel metrics)
+    const lv_font_t* rig_font;       // one rig per row: name + marker
 };
 static Layout L = {};
 
@@ -118,6 +121,7 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_28;
         L.bt_credit_1_font = &font_styrene_24;
         L.bt_credit_2_font = &font_styrene_20;
+        L.rig_font         = &font_styrene_20;
     } else if (c.height >= 300) {
         // Compact layout — tuned for 368x448 (AMOLED-1.8).
         L.content_y = 85;
@@ -132,6 +136,7 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_20;
         L.bt_credit_1_font = &font_styrene_16;
         L.bt_credit_2_font = &font_styrene_14;
+        L.rig_font         = &font_styrene_16;
     } else {
         // Small layout — tuned for 240x240 (LCD-1.54 and similar square TFTs).
         // Everything shrinks: fonts two steps down, panels ~half height, and
@@ -174,6 +179,7 @@ static void compute_layout(const BoardCaps& c) {
         L.bt_device_font   = &font_styrene_14;
         L.bt_credit_1_font = &font_styrene_12;
         L.bt_credit_2_font = &font_styrene_12;
+        L.rig_font         = &font_styrene_12;
     }
 
     L.content_w = L.scr_w - 2 * L.margin;
@@ -545,6 +551,208 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.anim_y);
 }
 
+// ======== Machine Screen ========
+// CPU bar, RAM bar, then the rigs in two columns. Fed by the daemon's optional
+// "cpu"/"rf"/"rp"/"rg" keys; widgets change only when a payload carried them.
+
+struct RigRow {
+    lv_obj_t* row;
+    lv_obj_t* dot;
+    lv_obj_t* name;
+};
+static lv_obj_t* machine_container;
+static lv_obj_t* machine_group;     // panels — shown while machine data is live
+static lv_obj_t* machine_empty;     // "No Machine Data" — old daemon, stale or disconnected
+static lv_obj_t* lbl_cpu_pct;
+static lv_obj_t* bar_cpu;
+static lv_obj_t* lbl_ram_free;
+static lv_obj_t* bar_ram;
+static lv_obj_t* lbl_no_rigs;
+static RigRow    rig_rows[MACHINE_MAX_RIGS];
+static int       rig_slots = 0;            // rows x 2 columns that fit the rigs panel
+static uint32_t  machine_seq = 0;          // last MachineData.seq drawn
+static bool      machine_have = false;     // got machine keys on this BLE link
+static uint32_t  last_payload_ms = 0;      // any payload, ok or not
+static int       machine_view = -1;        // -1 unknown / 0 empty / 1 live
+
+static lv_obj_t* make_group(lv_obj_t* parent) {
+    lv_obj_t* g = lv_obj_create(parent);
+    lv_obj_set_size(g, L.scr_w, L.scr_h);
+    lv_obj_set_pos(g, 0, 0);
+    lv_obj_set_style_bg_opa(g, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g, 0, 0);
+    lv_obj_set_style_pad_all(g, 0, 0);
+    lv_obj_clear_flag(g, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g, LV_OBJ_FLAG_EVENT_BUBBLE);
+    return g;
+}
+
+static lv_obj_t* make_meter_panel(lv_obj_t* parent, int y, int h, const char* pill_text,
+                                  lv_obj_t** out_value, lv_obj_t** out_bar) {
+    lv_obj_t* panel = make_panel(parent, L.margin, y, L.content_w, h);
+    *out_value = lv_label_create(panel);
+    lv_label_set_text(*out_value, "---");
+    lv_obj_set_style_text_font(*out_value, L.pct_font, 0);
+    lv_obj_set_style_text_color(*out_value, COL_TEXT, 0);
+    lv_obj_set_pos(*out_value, 0, 0);
+    lv_obj_t* pill = make_pill(panel, pill_text);
+    lv_obj_align(pill, LV_ALIGN_TOP_RIGHT, 0, 1);
+    *out_bar = make_bar(panel, 0, L.usage_bar_y, L.content_w - 2 * L.panel_pad_x, L.bar_h);
+    return panel;
+}
+
+static void init_machine_screen(lv_obj_t* scr) {
+    machine_container = make_group(scr);
+    lv_obj_clear_flag(machine_container, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(machine_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(machine_container, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t* title = lv_label_create(machine_container);
+    lv_label_set_text(title, "Machine");
+    lv_obj_set_style_text_font(title, L.title_font, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, L.title_nudge, L.title_y);
+
+    machine_group = make_group(machine_container);
+    const int panel_h = L.usage_bar_y + L.bar_h + 2 * L.panel_pad_y;
+    int y = L.content_y;
+    make_meter_panel(machine_group, y, panel_h, "CPU", &lbl_cpu_pct, &bar_cpu);
+    y += panel_h + L.usage_panel_gap;
+    make_meter_panel(machine_group, y, panel_h, "Free RAM", &lbl_ram_free, &bar_ram);
+    y += panel_h + L.usage_panel_gap;
+
+    // Rigs: as many rows as fit above the bottom margin, two columns.
+    const int rigs_h = L.scr_h - y - L.margin;
+    lv_obj_t* rigs = make_panel(machine_group, L.margin, y, L.content_w, rigs_h);
+    const int inner_w = L.content_w - 2 * L.panel_pad_x;
+    const int line_h = lv_font_get_line_height(L.rig_font);
+    const int row_h = line_h + line_h / 4;
+    const int rows = (rigs_h - 2 * L.panel_pad_y) / row_h;
+    rig_slots = rows * 2;
+    if (rig_slots > MACHINE_MAX_RIGS) rig_slots = MACHINE_MAX_RIGS;
+    const int dot = line_h / 2;
+    for (int i = 0; i < rig_slots; i++) {
+        RigRow& r = rig_rows[i];
+        r.row = lv_obj_create(rigs);
+        lv_obj_set_size(r.row, inner_w / 2, row_h);
+        lv_obj_set_pos(r.row, (i % 2) * (inner_w / 2), (i / 2) * row_h);
+        lv_obj_set_style_bg_opa(r.row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(r.row, 0, 0);
+        lv_obj_set_style_pad_all(r.row, 0, 0);
+        lv_obj_clear_flag(r.row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(r.row, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+        r.dot = lv_obj_create(r.row);
+        lv_obj_set_size(r.dot, dot, dot);
+        lv_obj_set_style_radius(r.dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_all(r.dot, 0, 0);
+        lv_obj_clear_flag(r.dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(r.dot, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_align(r.dot, LV_ALIGN_LEFT_MID, 0, 0);
+
+        r.name = lv_label_create(r.row);
+        lv_obj_set_style_text_font(r.name, L.rig_font, 0);
+        lv_obj_align(r.name, LV_ALIGN_LEFT_MID, dot + dot, 0);
+        lv_obj_add_flag(r.row, LV_OBJ_FLAG_HIDDEN);
+    }
+    lbl_no_rigs = lv_label_create(rigs);
+    lv_label_set_text(lbl_no_rigs, "No Rigs Found");
+    lv_obj_set_style_text_font(lbl_no_rigs, L.rig_font, 0);
+    lv_obj_set_style_text_color(lbl_no_rigs, COL_DIM, 0);
+    lv_obj_set_pos(lbl_no_rigs, 0, 0);
+    lv_obj_add_flag(lbl_no_rigs, LV_OBJ_FLAG_HIDDEN);
+
+    machine_empty = make_group(machine_container);
+    lv_obj_t* l1 = lv_label_create(machine_empty);
+    lv_label_set_text(l1, "No Machine Data");
+    lv_obj_set_style_text_font(l1, L.bt_status_font, 0);
+    lv_obj_set_style_text_color(l1, COL_TEXT, 0);
+    lv_obj_align(l1, LV_ALIGN_TOP_MID, 0, L.content_y + L.pair_y1);
+    lv_obj_t* l2 = lv_label_create(machine_empty);
+    lv_label_set_text(l2, "Run the latest Clawdmeter daemon.");
+    lv_obj_set_style_text_font(l2, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(l2, COL_DIM, 0);
+    lv_obj_set_width(l2, L.content_w);
+    lv_label_set_long_mode(l2, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(l2, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(l2, LV_ALIGN_TOP_MID, 0, L.content_y + L.pair_y2);
+    lv_obj_add_flag(machine_empty, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void set_rig_row(RigRow& r, const char* name, int state, bool more) {
+    lv_label_set_text(r.name, name);
+    lv_obj_set_style_text_color(r.name, (more || state == RIG_DOWN) ? COL_DIM : COL_TEXT, 0);
+    if (more) {
+        lv_obj_add_flag(r.dot, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(r.dot, LV_OBJ_FLAG_HIDDEN);
+        // Up: solid green. Partial: solid amber. Down: hollow ring.
+        lv_color_t c = state == RIG_UP ? COL_GREEN : state == RIG_PARTIAL ? COL_AMBER : COL_DIM;
+        lv_obj_set_style_bg_color(r.dot, c, 0);
+        lv_obj_set_style_bg_opa(r.dot, state == RIG_DOWN ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(r.dot, c, 0);
+        lv_obj_set_style_border_width(r.dot, state == RIG_DOWN ? 2 : 0, 0);
+    }
+    lv_obj_clear_flag(r.row, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void draw_machine(const MachineData* m) {
+    char buf[24];
+    lv_label_set_text_fmt(lbl_cpu_pct, "%d%%", m->cpu_pct);
+    lv_bar_set_value(bar_cpu, m->cpu_pct, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar_cpu, pct_color((float)m->cpu_pct), LV_PART_INDICATOR);
+
+    snprintf(buf, sizeof(buf), "%.1f GB", m->ram_free_gb);
+    lv_label_set_text(lbl_ram_free, buf);
+    lv_bar_set_value(bar_ram, m->ram_used_pct, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar_ram, pct_color((float)m->ram_used_pct), LV_PART_INDICATOR);
+
+    // More rigs than slots: the last slot says how many are hidden. The daemon
+    // sorts up rigs first, so the hidden ones are the down ones.
+    const int n = m->rig_count;
+    const bool overflow = n > rig_slots;
+    const int shown = overflow ? rig_slots - 1 : n;
+    for (int i = 0; i < rig_slots; i++) {
+        if (i < shown) {
+            set_rig_row(rig_rows[i], m->rigs[i].name, m->rigs[i].state, false);
+        } else if (overflow && i == shown) {
+            snprintf(buf, sizeof(buf), "+%d more", n - shown);
+            set_rig_row(rig_rows[i], buf, RIG_DOWN, true);
+        } else {
+            lv_obj_add_flag(rig_rows[i].row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (n == 0) lv_obj_clear_flag(lbl_no_rigs, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_add_flag(lbl_no_rigs, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Live panels or "No Machine Data". Live = machine keys arrived on this link
+// and the daemon is still writing (any payload within DATA_FRESH_MS).
+static void update_machine_view(void) {
+    if (!machine_group || !machine_empty) return;
+    int v = (s_ble_connected && machine_have &&
+             (lv_tick_get() - last_payload_ms) < DATA_FRESH_MS) ? 1 : 0;
+    if (v == machine_view) return;
+    machine_view = v;
+    if (v) {
+        lv_obj_clear_flag(machine_group, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(machine_empty, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(machine_group, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(machine_empty, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void ui_update_machine(const MachineData* m) {
+    last_payload_ms = lv_tick_get();
+    if (m->seq != machine_seq) {
+        machine_seq = m->seq;
+        machine_have = true;
+        draw_machine(m);
+    }
+    update_machine_view();
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -562,6 +770,7 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    init_machine_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -640,6 +849,7 @@ static void update_weekly_pace(const UsageData* data) {
 
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
+    ui_update_machine(&data->machine);   // machine keys ride on ok and no-data beats alike
     data_ok = data->ok;
     if (!data->ok) return;          // a {"ok":false} "no data" beat → fall through to idle, keep last numbers
     last_data_ms = lv_tick_get();   // a real usage update just landed
@@ -748,6 +958,7 @@ static void update_view_state(void) {
 }
 
 void ui_tick_anim(void) {
+    if (current_screen == SCREEN_MACHINE) update_machine_view();
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
@@ -812,19 +1023,28 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
+// Tap cycles splash -> usage -> machine -> splash.
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    switch (current_screen) {
+    case SCREEN_SPLASH: ui_show_screen(SCREEN_USAGE);   break;
+    case SCREEN_USAGE:  ui_show_screen(SCREEN_MACHINE); break;
+    default:            ui_show_screen(SCREEN_SPLASH);  break;
+    }
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(machine_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:  splash_show(); break;
     case SCREEN_USAGE:   lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_MACHINE:
+        update_machine_view();
+        lv_obj_clear_flag(machine_container, LV_OBJ_FLAG_HIDDEN);
+        break;
     default: break;
     }
 
@@ -854,8 +1074,11 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
     s_ble_connected = (state == BLE_STATE_CONNECTED);
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
+    // A new link may be an older daemon that never sends machine keys.
+    if (!s_ble_connected) machine_have = false;
     // pair / idle / usage — picked from connection + data freshness.
     update_view_state();
+    update_machine_view();
 }
 
 void ui_update_battery(int percent, bool charging) {
