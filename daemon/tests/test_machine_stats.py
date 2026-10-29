@@ -223,7 +223,15 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from daemon import claude_usage_daemon_windows as d
+
+
+@pytest.fixture(autouse=True)
+def _quiet_daemon_log(monkeypatch):
+    """Keep Session.write_payload out of the real %LOCALAPPDATA% daemon.log."""
+    monkeypatch.setattr(d, "log", lambda _msg: None)
 
 USAGE = {"s": 42, "sr": 180, "w": 17, "wr": 8820, "st": "allowed", "acct": "pro", "ok": True}
 FIELDS = {"cpu": 37, "rf": 14.2, "rp": 56, "rg": [["inv1", 1], ["s9", 0]]}
