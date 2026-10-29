@@ -123,6 +123,25 @@ static bool parse_json(const char* json, UsageData* out) {
     out->clock_fmt = doc["tf"] | 24;
     out->ok = doc["ok"] | false;
     out->valid = true;
+
+    // Machine meter keys are optional and sticky: the daemon sends them only
+    // when a value changed, so a payload without them keeps the last values.
+    if (!doc["cpu"].isNull()) {
+        MachineData& m = out->machine;
+        m.cpu_pct = doc["cpu"] | 0;
+        m.ram_free_gb = doc["rf"] | 0.0f;
+        m.ram_used_pct = doc["rp"] | 0;
+        m.rig_count = 0;
+        for (JsonArrayConst r : doc["rg"].as<JsonArrayConst>()) {
+            if (m.rig_count >= MACHINE_MAX_RIGS) break;
+            RigStatus& rs = m.rigs[m.rig_count++];
+            strlcpy(rs.name, r[0] | "?", sizeof(rs.name));
+            rs.state = r[1] | 0;
+        }
+        m.seq++;
+        Serial.printf("machine: cpu=%d rf=%.1f rp=%d rigs=%u\n",
+            m.cpu_pct, m.ram_free_gb, m.ram_used_pct, (unsigned)m.rig_count);
+    }
     return true;
 }
 
@@ -344,8 +363,8 @@ void loop() {
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // On splash: cycle animations. On the usage view: cycle
-                // screen brightness (single non-splash view, no more screens).
+                // On splash: cycle animations. On the usage and machine
+                // views: cycle screen brightness.
                 if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
                 else                                          brightness_cycle();
             }
