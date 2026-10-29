@@ -250,7 +250,9 @@ def main() -> None:
     from pystray import Menu, MenuItem
 
     import daemon.autostart_windows as autostart
-    from daemon.claude_usage_daemon_windows import main as daemon_main, log as daemon_log
+    from daemon import machine_stats, overlay_windows
+    from daemon.claude_usage_daemon_windows import (
+        CONFIG_FILE, main as daemon_main, log as daemon_log)
     from daemon.icon_assets import load_logo_rgba, build_state_icons
 
     # Build per-state icons once at startup; swap icon.icon per tick (never recomposite).
@@ -338,11 +340,29 @@ def main() -> None:
             autostart.enable(tray_script=os.path.abspath(__file__))
         icon.update_menu()
 
+    # The overlay window belongs to this (main) thread: pystray's GetMessage
+    # loop below pumps every window of the thread, and menu callbacks run here.
+    overlay = overlay_windows.MachineOverlay(machine_stats.shared_sampler())
+    if overlay_windows.read_setting(CONFIG_FILE):
+        try:
+            overlay.show()
+        except OSError as e:   # a GDI failure must never stop the tray starting
+            daemon_log(f"Machine overlay failed to start: {e!r}")
+
+    def _on_overlay(_icon_ref, _item) -> None:
+        if overlay.enabled:
+            overlay.hide()
+        else:
+            overlay.show()
+        overlay_windows.write_setting(CONFIG_FILE, overlay.enabled)
+        icon.update_menu()
+
     icon.menu = Menu(
         # Non-clickable status header; text updates via update_menu() on state change.
         MenuItem(lambda _item: header_text(ts), None, enabled=False),
         # Start-at-login toggle: checked= is a CALLABLE for live query (Pitfall 6).
         MenuItem("Start at login", _on_toggle, checked=lambda _item: autostart.is_enabled()),
+        MenuItem("Machine overlay", _on_overlay, checked=lambda _item: overlay.enabled),
         MenuItem("Restart", _on_restart),
         MenuItem("Quit", _on_quit),
     )

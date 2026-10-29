@@ -298,3 +298,44 @@ def test_session_without_sampler_sends_usage_unchanged():
     finally:
         loop.close()
     assert _sent(client) == USAGE
+
+
+# ---------------------------------------------------------------------------
+# Overlay pure helpers (overlay_windows.py)
+# ---------------------------------------------------------------------------
+
+from daemon import overlay_windows as ov
+
+
+def test_rig_line_names_up_and_partial_and_counts_down():
+    rigs = (("inv1", 1), ("main", 2), ("ci1", 0), ("t1", 0))
+    assert ov.rig_line(rigs) == "inv1 up \u00b7 main partial \u00b7 2 down"
+
+
+def test_rig_line_empty():
+    assert ov.rig_line(()) == "No rigs found"
+
+
+def test_overlay_content_equal_for_equal_snapshots():
+    a = m.Snapshot(37, 14.2, 56, (("inv1", 1),))
+    assert ov.content(a) == ov.content(m.Snapshot(37, 14.2, 56, (("inv1", 1),)))
+    assert ov.content(a) != ov.content(a._replace(cpu=38))
+    assert ov.content(a)[0] == "CPU 37%" and ov.content(a)[2] == "RAM 14.2 GB free"
+    assert ov.content(None) is None
+
+
+def test_overlay_pct_color_thresholds():
+    assert ov.pct_color(49) == ov.COL_GREEN
+    assert ov.pct_color(50) == ov.COL_AMBER
+    assert ov.pct_color(80) == ov.COL_RED
+
+
+def test_overlay_setting_round_trip_keeps_other_lines(tmp_path):
+    cfg = tmp_path / "Clawdmeter" / "config"
+    assert ov.read_setting(cfg) is False
+    ov.write_setting(cfg, True)
+    assert ov.read_setting(cfg) is True
+    cfg.write_text("chime = on\noverlay = on  # desk\nclock = 24\n")
+    ov.write_setting(cfg, False)
+    assert cfg.read_text() == "chime = on\noverlay = off\nclock = 24\n"
+    assert ov.read_setting(cfg) is False
