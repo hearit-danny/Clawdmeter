@@ -4,12 +4,18 @@ One borderless layered window docked bottom-right above the taskbar:
 
     CPU 37%          RAM 14.2 GB free
     [=====-------]   [=========---]
-    inv1 up · main partial · 7 down
+    inv1 up · g1 partial · 7 down
 
 WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
 WS_EX_NOACTIVATE make it click-through, never focused and absent from
 Alt-Tab. It is painted with UpdateLayeredWindow from a premultiplied 32-bit
-DIB, so there is no WM_PAINT and no timer.
+DIB, so there is no WM_PAINT.
+
+Hover: a click-through window gets no mouse messages, so a coalescable
+250 ms timer compares the cursor with the panel. Resting on the RAM half
+opens a card above the panel with the processes using the most memory (one
+NtQuerySystemInformation read, repeated every 3 s while it stays open);
+resting on the rig line opens one with every rig's ports.
 
 Threading: the window must belong to the thread that pumps messages, which
 is the tray's main thread (pystray runs GetMessage(NULL) there and so
@@ -24,9 +30,17 @@ import sys
 from ctypes import wintypes
 from pathlib import Path
 
+from daemon import machine_stats
+
 OPACITY = 178            # 70% of 255
 BASE_W, BASE_H = 280, 50  # at 96 dpi
 MARGIN = 8
+TOP_ROW_H = 27           # CPU / RAM labels and bars; the rig line sits below
+CARD_GAP, ROW_H = 6, 16
+HOVER_MS = 250
+HOVER_TICKS = 2          # rest this many ticks before a card opens
+RAM_REFRESH_TICKS = 12   # 3 s
+MAX_CARD_RIGS = 10
 
 # theme.h colors as COLORREF (0x00BBGGRR)
 def _rgb(hex_rgb: int) -> int:
@@ -57,23 +71,69 @@ def pct_color(pct: int) -> int:
 
 
 def rig_line(rigs) -> str:
-    """'inv1 up · main partial · 7 down' or 'No rigs found'."""
+    """'inv1 up · g1 partial · 7 down' or 'No rigs found'."""
     if not rigs:
         return "No rigs found"
-    parts = [f"{name} {_STATE_WORD[state]}" for name, state in rigs if state in _STATE_WORD]
-    down = sum(1 for _, state in rigs if state not in _STATE_WORD)
+    parts = [f"{r[0]} {_STATE_WORD[r[1]]}" for r in rigs if r[1] in _STATE_WORD]
+    down = sum(1 for r in rigs if r[1] not in _STATE_WORD)
     if down:
         parts.append(f"{down} down")
     return " · ".join(parts)
 
 
-def content(snap) -> tuple | None:
-    """What the overlay draws for a snapshot; equal tuples mean no redraw."""
+def size_text(n: int) -> str:
+    return f"{n / 2**30:.1f} GB" if n >= 2**30 else f"{n // 2**20} MB"
+
+
+def rig_card(rigs) -> tuple:
+    """Card rows: ("title", text), ("rig", name, state, ((label, port, open), ...)), ("more", text)."""
+    if not rigs:
+        return (("title", "No stack.env rigs found"),)
+    rows = [("title", "Rigs · ports on 127.0.0.1")]
+    rows += [("rig", r[0], r[1], r[2] if len(r) > 2 else ()) for r in rigs[:MAX_CARD_RIGS]]
+    if len(rigs) > MAX_CARD_RIGS:
+        rows.append(("more", f"+{len(rigs) - MAX_CARD_RIGS} more"))
+    return tuple(rows)
+
+
+def ram_card(detail) -> tuple:
+    """Card rows: ("title", text), ("proc", name, size text)."""
+    if detail is None:
+        return (("title", "Memory detail unavailable"),)
+    used, total, top = detail
+    rows = [("title", f"In use {used:.1f} of {total:.1f} GB · largest apps")]
+    rows += [("proc", name if count == 1 else f"{name} ({count})", size_text(size))
+             for name, size, count in top]
+    return tuple(rows)
+
+
+def content(snap, card: tuple = ()) -> tuple | None:
+    """What the overlay draws for a snapshot and open card; equal tuples mean no redraw."""
     if snap is None:
         return None
     return (f"CPU {snap.cpu}%", snap.cpu,
             f"RAM {snap.ram_free_gb:.1f} GB free", snap.ram_used_pct,
-            rig_line(snap.rigs))
+            rig_line(snap.rigs), card)
+
+
+def hover_region(pt, rect, size, base_h: int, top_row_h: int) -> str | None:
+    """Which part of the window the cursor is on.
+
+    rect is the window rect in the coordinates of pt; size is the bitmap
+    (w, h) and the panel is its bottom base_h pixels. Returns None outside,
+    "card" above the panel, else "cpu", "ram" or "rigs".
+    """
+    left, top, right, bottom = rect
+    x, y = pt
+    if not (left <= x < right and top <= y < bottom) or right <= left or bottom <= top:
+        return None
+    bx = (x - left) * size[0] / (right - left)
+    by = (y - top) * size[1] / (bottom - top) - (size[1] - base_h)
+    if by < 0:
+        return "card"
+    if by < top_row_h:
+        return "cpu" if bx < size[0] / 2 else "ram"
+    return "rigs"
 
 
 def read_setting(path: Path) -> bool:
@@ -167,6 +227,10 @@ if sys.platform == "win32":
          ctypes.POINTER(wintypes.RECT), wintypes.UINT)
     _sig(user32.GetDpiForWindow, wintypes.UINT, wintypes.HWND)
     _sig(user32.SetThreadDpiAwarenessContext, wintypes.HANDLE, wintypes.HANDLE)
+    _sig(user32.SetCoalescableTimer, ctypes.c_size_t, wintypes.HWND, ctypes.c_size_t,
+         wintypes.UINT, ctypes.c_void_p, wintypes.ULONG)
+    _sig(user32.GetCursorPos, wintypes.BOOL, ctypes.POINTER(wintypes.POINT))
+    _sig(user32.GetWindowRect, wintypes.BOOL, wintypes.HWND, ctypes.POINTER(wintypes.RECT))
     _sig(kernel32.GetModuleHandleW, wintypes.HMODULE, wintypes.LPCWSTR)
     _sig(gdi32.CreateCompatibleDC, wintypes.HDC, wintypes.HDC)
     _sig(gdi32.DeleteDC, wintypes.BOOL, wintypes.HDC)
@@ -182,6 +246,8 @@ if sys.platform == "win32":
     _sig(gdi32.SetTextColor, wintypes.COLORREF, wintypes.HDC, wintypes.COLORREF)
     _sig(gdi32.RoundRect, wintypes.BOOL, wintypes.HDC, ctypes.c_int, ctypes.c_int,
          ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)
+    _sig(gdi32.Ellipse, wintypes.BOOL, wintypes.HDC, ctypes.c_int, ctypes.c_int,
+         ctypes.c_int, ctypes.c_int)
     _sig(gdi32.GetStockObject, wintypes.HGDIOBJ, ctypes.c_int)
     _sig(gdi32.GdiFlush, wintypes.BOOL)
 
@@ -197,7 +263,10 @@ WM_SETTINGCHANGE = 0x001A
 WM_DPICHANGED = 0x02E0
 WM_MOUSEACTIVATE = 0x0021
 WM_NCHITTEST = 0x0084
+WM_TIMER = 0x0113
 WM_REDRAW = 0x8000 + 0x51   # WM_APP + 0x51
+HOVER_TIMER_ID = 1
+HOVER_TOLERANCE_MS = 100
 MA_NOACTIVATE = 3
 HTTRANSPARENT = -1
 SPI_GETWORKAREA = 0x0030
@@ -206,6 +275,8 @@ AC_SRC_ALPHA = 0x1
 TRANSPARENT_BK = 1
 NULL_PEN = 8
 DT_LEFT_SINGLE = 0x0000 | 0x0020 | 0x0800 | 0x8000   # DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+DT_RIGHT_SINGLE = DT_LEFT_SINGLE | 0x0002
+COL_STATE = {1: COL_GREEN, 2: COL_AMBER}
 ANTIALIASED_QUALITY = 4
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 _CLASS = "ClawdmeterMachineOverlay"
@@ -222,6 +293,13 @@ class MachineOverlay:
         self._gdi = None       # (memdc, dib, bits, font, old_bmp, old_font, w, h, alpha)
         self._drawn = None
         self._dpi = 0
+        self._rows = 0         # card rows the bitmap was sized for
+        self._base_h = 0       # panel height in pixels; a card sits above it
+        self._hover = None     # None, "ram" or "rigs": the open card
+        self._pending = None   # card the cursor is resting on, not yet open
+        self._pending_n = 0
+        self._ram = None       # machine_stats.memory_detail() while the RAM card is open
+        self._ram_age = 0
         sampler.add_listener(self._on_sample)
 
     @property
@@ -260,16 +338,21 @@ class MachineOverlay:
         self._drawn = None
         self._paint()
         user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
+        user32.SetCoalescableTimer(self._hwnd, HOVER_TIMER_ID, HOVER_MS, None, HOVER_TOLERANCE_MS)
 
     def hide(self) -> None:
         hwnd, self._hwnd = self._hwnd, None
         if hwnd:
-            user32.DestroyWindow(hwnd)
+            user32.DestroyWindow(hwnd)   # also kills the hover timer
         self._free_gdi()
+        self._hover = self._pending = self._ram = None
 
     def _proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_REDRAW:
             self._paint()
+            return 0
+        if msg == WM_TIMER and wparam == HOVER_TIMER_ID:
+            self._on_hover_tick()
             return 0
         if msg in (WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_DPICHANGED):
             self._drawn = None   # work area or scale moved: lay out again
@@ -281,6 +364,52 @@ class MachineOverlay:
             return HTTRANSPARENT
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
+    def _card(self) -> tuple:
+        if self._hover == "rigs" and self._sampler.snapshot is not None:
+            return rig_card(self._sampler.snapshot.rigs)
+        if self._hover == "ram":
+            return ram_card(self._ram)
+        return ()
+
+    def _read_ram(self) -> None:
+        try:
+            self._ram = machine_stats.memory_detail()
+        except Exception:
+            self._ram = None
+        self._ram_age = 0
+
+    def _on_hover_tick(self) -> None:
+        if not self._hwnd or not self._gdi:
+            return
+        pt, r = wintypes.POINT(), wintypes.RECT()
+        if not user32.GetCursorPos(ctypes.byref(pt)) or not user32.GetWindowRect(self._hwnd, ctypes.byref(r)):
+            return
+        s = self._dpi / 96
+        region = hover_region((pt.x, pt.y), (r.left, r.top, r.right, r.bottom),
+                              (self._gdi[6], self._gdi[7]), self._base_h, round(TOP_ROW_H * s))
+        target = self._hover if region == "card" else region if region in ("ram", "rigs") else None
+        if target == self._hover:
+            self._pending = None
+            if target == "ram":
+                self._ram_age += 1
+                if self._ram_age >= RAM_REFRESH_TICKS:
+                    self._read_ram()
+                    self._paint()
+            return
+        if target is not None:
+            # Open only after the cursor rests, so passing over the panel does nothing.
+            self._pending_n = self._pending_n + 1 if target == self._pending else 1
+            self._pending = target
+            if self._pending_n < HOVER_TICKS:
+                return
+        self._pending = None
+        self._hover = target
+        if target == "ram":
+            self._read_ram()
+        else:
+            self._ram = None
+        self._paint()
+
     def _free_gdi(self) -> None:
         if self._gdi:
             memdc, dib, _bits, font, old_bmp, old_font, *_ = self._gdi
@@ -291,13 +420,14 @@ class MachineOverlay:
             gdi32.DeleteDC(memdc)
             self._gdi = None
 
-    def _ensure_gdi(self) -> bool:
+    def _ensure_gdi(self, rows: int) -> bool:
         dpi = user32.GetDpiForWindow(self._hwnd) or 96
-        if self._gdi and dpi == self._dpi:
+        if self._gdi and dpi == self._dpi and rows == self._rows:
             return True
         self._free_gdi()
-        self._dpi = dpi
-        w, h = BASE_W * dpi // 96, BASE_H * dpi // 96
+        self._dpi, self._rows = dpi, rows
+        self._base_h = BASE_H * dpi // 96
+        w, h = BASE_W * dpi // 96, self._base_h + self._card_h(rows, dpi / 96)
         memdc = gdi32.CreateCompatibleDC(None)
         bmi = BITMAPINFOHEADER(biSize=ctypes.sizeof(BITMAPINFOHEADER), biWidth=w,
                                biHeight=-h, biPlanes=1, biBitCount=32, biCompression=0)
@@ -320,6 +450,11 @@ class MachineOverlay:
         self._gdi = (memdc, dib, bits.value, font, old_bmp, old_font, w, h, alpha)
         return True
 
+    @staticmethod
+    def _card_h(rows: int, s: float) -> int:
+        """Card height plus the gap below it; 0 with no card."""
+        return round((ROW_H * rows + 12 + CARD_GAP) * s) if rows else 0
+
     def _fill_panel(self, color: int) -> None:
         memdc, *_rest = self._gdi
         w, h = self._gdi[6], self._gdi[7]
@@ -329,9 +464,30 @@ class MachineOverlay:
         old_brush = gdi32.SelectObject(memdc, brush)
         old_pen = gdi32.SelectObject(memdc, gdi32.GetStockObject(NULL_PEN))
         r = 10 * self._dpi // 96
-        gdi32.RoundRect(memdc, 0, 0, w + 1, h + 1, r, r)
+        gdi32.RoundRect(memdc, 0, h - self._base_h, w + 1, h + 1, r, r)
+        if self._rows:
+            card_h = h - self._base_h - round(CARD_GAP * self._dpi / 96)
+            gdi32.RoundRect(memdc, 0, 0, w + 1, card_h + 1, r, r)
         gdi32.SelectObject(memdc, old_pen)
         gdi32.SelectObject(memdc, old_brush)
+        gdi32.DeleteObject(brush)
+
+    def _dot(self, x: int, y: int, d: int, state: int) -> None:
+        """Filled dot for up and partial, a ring for down (as on the device)."""
+        memdc = self._gdi[0]
+        old_pen = gdi32.SelectObject(memdc, gdi32.GetStockObject(NULL_PEN))
+        brush = gdi32.CreateSolidBrush(COL_STATE.get(state, COL_DIM))
+        old_brush = gdi32.SelectObject(memdc, brush)
+        gdi32.Ellipse(memdc, x, y, x + d + 1, y + d + 1)
+        if state not in COL_STATE:
+            inner = gdi32.CreateSolidBrush(COL_PANEL)
+            gdi32.SelectObject(memdc, inner)
+            k = max(1, d // 4)
+            gdi32.Ellipse(memdc, x + k, y + k, x + d + 1 - k, y + d + 1 - k)
+            gdi32.SelectObject(memdc, brush)
+            gdi32.DeleteObject(inner)
+        gdi32.SelectObject(memdc, old_brush)
+        gdi32.SelectObject(memdc, old_pen)
         gdi32.DeleteObject(brush)
 
     def _bar(self, x: int, y: int, w: int, h: int, pct: int) -> None:
@@ -345,32 +501,60 @@ class MachineOverlay:
             user32.FillRect(memdc, ctypes.byref(wintypes.RECT(x, y, x + fill_w, y + h)), fill)
             gdi32.DeleteObject(fill)
 
-    def _text(self, text: str, x: int, y: int, w: int, h: int, color: int) -> None:
+    def _text(self, text: str, x: int, y: int, w: int, h: int, color: int,
+              flags: int = DT_LEFT_SINGLE) -> None:
         memdc = self._gdi[0]
         gdi32.SetTextColor(memdc, color)
-        user32.DrawTextW(memdc, text, -1, ctypes.byref(wintypes.RECT(x, y, x + w, y + h)),
-                         DT_LEFT_SINGLE)
+        user32.DrawTextW(memdc, text, -1, ctypes.byref(wintypes.RECT(x, y, x + w, y + h)), flags)
+
+    def _draw_card(self, card: tuple, pad: int, s: float, w: int) -> None:
+        line_h = round(ROW_H * s)
+        size_w, name_w, port_w = round(64 * s), round(60 * s), round(62 * s)
+        y = round(6 * s)
+        for row in card:
+            kind = row[0]
+            if kind == "proc":
+                self._text(row[1], pad, y, w - 2 * pad - size_w, line_h, COL_TEXT)
+                self._text(row[2], w - pad - size_w, y, size_w, line_h, COL_TEXT, DT_RIGHT_SINGLE)
+            elif kind == "rig":
+                _, name, state, ports = row
+                d = round(8 * s)
+                self._dot(pad, y + (line_h - d) // 2, d, state)
+                self._text(name, pad + round(14 * s), y, name_w, line_h,
+                           COL_TEXT if state in COL_STATE else COL_DIM)
+                x = pad + round(76 * s)
+                for label, port, is_open in ports:
+                    self._text(f"{label} {port}", x, y, port_w, line_h,
+                               COL_GREEN if is_open else COL_DIM)
+                    x += port_w
+            else:   # title, more
+                self._text(row[1], pad, y, w - 2 * pad, line_h, COL_DIM)
+            y += line_h
 
     def _paint(self) -> None:
         if not self._hwnd:
             return
-        c = content(self._sampler.snapshot)
+        card = self._card()
+        c = content(self._sampler.snapshot, card)
         if c is None or c == self._drawn:
             return
-        if not self._ensure_gdi():
+        if not self._ensure_gdi(len(card)):
             return
         memdc, _dib, bits, _f, _ob, _of, w, h, alpha = self._gdi
         s = self._dpi / 96
         pad, col_w = round(8 * s), (w - round(24 * s)) // 2
         line_h, bar_h = round(16 * s), max(2, round(3 * s))
-        cpu_text, cpu, ram_text, ram_used, rigs_text = c
+        cpu_text, cpu, ram_text, ram_used, rigs_text, _card = c
+        y0 = h - self._base_h
 
         self._fill_panel(COL_PANEL)
-        self._text(cpu_text, pad, round(4 * s), col_w, line_h, COL_TEXT)
-        self._text(ram_text, w - pad - col_w, round(4 * s), col_w, line_h, COL_TEXT)
-        self._bar(pad, round(21 * s), col_w, bar_h, cpu)
-        self._bar(w - pad - col_w, round(21 * s), col_w, bar_h, ram_used)
-        self._text(rigs_text, pad, round(29 * s), w - 2 * pad, line_h, COL_DIM)
+        self._text(cpu_text, pad, y0 + round(4 * s), col_w, line_h, COL_TEXT)
+        self._text(ram_text, w - pad - col_w, y0 + round(4 * s), col_w, line_h, COL_TEXT)
+        self._bar(pad, y0 + round(21 * s), col_w, bar_h, cpu)
+        self._bar(w - pad - col_w, y0 + round(21 * s), col_w, bar_h, ram_used)
+        self._text(rigs_text, pad, y0 + round(29 * s), w - 2 * pad, line_h, COL_DIM)
+        if card:
+            self._draw_card(card, pad, s, w)
         gdi32.GdiFlush()
 
         # Premultiply: every color byte scaled to 70%, then the alpha plane.

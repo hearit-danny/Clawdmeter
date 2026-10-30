@@ -235,7 +235,11 @@ The daemon also reports this PC's CPU load, free RAM and which MNIIS rigs are up
   screen ignores the new keys; a daemon without them leaves the screen on "No Machine Data".
 - **On the desktop:** tray menu **Machine overlay**. A small click-through panel docked
   bottom-right above the taskbar at 70% opacity: CPU and free RAM with two thin bars, and a
-  line like `inv1 up · main partial · 7 down`. It never takes focus and is not in Alt-Tab.
+  line like `inv1 up · g1 partial · 7 down`. It never takes focus and is not in Alt-Tab.
+  Rest the cursor on it for half a second to open a card above the panel:
+  - **RAM half** - memory in use and the six apps using the most, by private working set
+    (the Task Manager Memory column), grouped by name with the process count.
+  - **Rig line** - every rig with its db, api and web ports, green when listening.
 
 How it is sampled (`daemon/machine_stats.py`, stdlib and ctypes only):
 
@@ -243,13 +247,18 @@ How it is sampled (`daemon/machine_stats.py`, stdlib and ctypes only):
 - Rigs every 60 s: the `stack.env` files `rigs.mjs` scans (the primary checkout's
   worktrees via `.git/worktrees/*/gitdir`, plus `RiderProjects\*` and `C:\wt\*`), then one
   non-blocking TCP connect per port to 127.0.0.1, all waited on in a single 50 ms select.
+  The primary checkout's own stack (5432/8080/5173) is not listed.
 - No docker, wsl.exe, WMI, PowerShell or subprocess. dockerd runs in the Ubuntu WSL distro
   and any docker or wsl call boots the VM when it is stopped; a refused connect does not.
 - Listeners run only when a rounded value changed. The device keys (`cpu`, `rf`, `rp`,
   `rg`) ride on the usage write the daemon already sends every 60 s, only when something
   changed and always on the first write of a connection; there is no extra BLE write. The
   rig list is trimmed so a payload stays within one 240-byte write. The overlay repaints
-  on the same change signal; it has no timer.
+  on the same change signal.
+- Hover: the overlay is click-through, so it gets no mouse messages. A coalescable
+  250 ms timer compares the cursor position with the panel. The RAM card's process list
+  is one `NtQuerySystemInformation` read when it opens and every 3 s while it stays
+  open; nothing is read or kept while it is closed.
 
 Measured cost on this PC (2026-10-29, Python 3.12, 3840x1600 at 100%):
 
