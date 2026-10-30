@@ -12,7 +12,8 @@ Alt-Tab. It is painted with UpdateLayeredWindow from a premultiplied 32-bit
 DIB, so there is no WM_PAINT.
 
 Hover: a click-through window gets no mouse messages, so a coalescable
-250 ms timer compares the cursor with the panel. Resting on the RAM half
+timer compares the cursor with the panel: every 700 ms while the cursor is
+far away, every 200 ms within NEAR_DIP of the window. Resting on the RAM half
 opens a card above the panel with the processes using the most memory (one
 NtQuerySystemInformation read, repeated every 3 s while it stays open);
 resting on the rig line opens one with every rig's ports.
@@ -37,9 +38,12 @@ BASE_W, BASE_H = 280, 50  # at 96 dpi
 MARGIN = 8
 TOP_ROW_H = 27           # CPU / RAM labels and bars; the rig line sits below
 CARD_GAP, ROW_H = 6, 16
-HOVER_MS = 250
-HOVER_TICKS = 2          # rest this many ticks before a card opens
-RAM_REFRESH_TICKS = 12   # 3 s
+# Each tick costs about 0.45M cycles, mostly message dispatch into Python, so
+# the timer runs slow until the cursor comes near.
+HOVER_FAR_MS, HOVER_NEAR_MS = 700, 200
+NEAR_DIP = 150
+HOVER_TICKS = 2          # rest this many near ticks before a card opens
+RAM_REFRESH_TICKS = 15   # 3 s of near ticks
 MAX_CARD_RIGS = 10
 
 # theme.h colors as COLORREF (0x00BBGGRR)
@@ -114,6 +118,12 @@ def content(snap, card: tuple = ()) -> tuple | None:
     return (f"CPU {snap.cpu}%", snap.cpu,
             f"RAM {snap.ram_free_gb:.1f} GB free", snap.ram_used_pct,
             rig_line(snap.rigs), card)
+
+
+def is_near(pt, rect, margin: int) -> bool:
+    """Cursor within `margin` pixels of the window rect."""
+    left, top, right, bottom = rect
+    return left - margin <= pt[0] < right + margin and top - margin <= pt[1] < bottom + margin
 
 
 def hover_region(pt, rect, size, base_h: int, top_row_h: int) -> str | None:
@@ -295,6 +305,7 @@ class MachineOverlay:
         self._dpi = 0
         self._rows = 0         # card rows the bitmap was sized for
         self._base_h = 0       # panel height in pixels; a card sits above it
+        self._near = None      # hover timer speed: None (stopped), False (700 ms), True (200 ms)
         self._hover = None     # None, "ram" or "rigs": the open card
         self._pending = None   # card the cursor is resting on, not yet open
         self._pending_n = 0
@@ -338,7 +349,8 @@ class MachineOverlay:
         self._drawn = None
         self._paint()
         user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
-        user32.SetCoalescableTimer(self._hwnd, HOVER_TIMER_ID, HOVER_MS, None, HOVER_TOLERANCE_MS)
+        self._near = None
+        self._set_timer(False)
 
     def hide(self) -> None:
         hwnd, self._hwnd = self._hwnd, None
@@ -346,6 +358,13 @@ class MachineOverlay:
             user32.DestroyWindow(hwnd)   # also kills the hover timer
         self._free_gdi()
         self._hover = self._pending = self._ram = None
+
+    def _set_timer(self, near: bool) -> None:
+        if near != self._near:
+            self._near = near
+            user32.SetCoalescableTimer(self._hwnd, HOVER_TIMER_ID,
+                                       HOVER_NEAR_MS if near else HOVER_FAR_MS,
+                                       None, HOVER_TOLERANCE_MS)
 
     def _proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_REDRAW:
@@ -385,7 +404,13 @@ class MachineOverlay:
         if not user32.GetCursorPos(ctypes.byref(pt)) or not user32.GetWindowRect(self._hwnd, ctypes.byref(r)):
             return
         s = self._dpi / 96
-        region = hover_region((pt.x, pt.y), (r.left, r.top, r.right, r.bottom),
+        rect = (r.left, r.top, r.right, r.bottom)
+        near = is_near((pt.x, pt.y), rect, round(NEAR_DIP * s))
+        self._set_timer(near)
+        if not near and self._hover is None:
+            self._pending = None
+            return
+        region = hover_region((pt.x, pt.y), rect,
                               (self._gdi[6], self._gdi[7]), self._base_h, round(TOP_ROW_H * s))
         target = self._hover if region == "card" else region if region in ("ram", "rigs") else None
         if target == self._hover:

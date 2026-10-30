@@ -418,6 +418,14 @@ def test_hover_region_maps_panel_parts():
     assert hit(1200, 640) == "rigs"
 
 
+def test_is_near_uses_margin_around_rect():
+    rect = (1000, 500, 1280, 550)
+    assert ov.is_near((900, 450), rect, 150)
+    assert ov.is_near((1100, 520), rect, 150)
+    assert not ov.is_near((800, 520), rect, 150)
+    assert not ov.is_near((1100, 300), rect, 150)
+
+
 def test_hover_region_scales_when_rect_and_bitmap_differ():
     # a DPI-virtualized rect at half the bitmap size still maps to the same parts
     hit = lambda x, y: ov.hover_region((x, y), (0, 0, 140, 25), (280, 50), 50, 27)
