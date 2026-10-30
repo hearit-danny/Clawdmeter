@@ -256,7 +256,8 @@ How it is sampled (`daemon/machine_stats.py`, stdlib and ctypes only):
   rig list is trimmed so a payload stays within one 240-byte write. The overlay repaints
   on the same change signal.
 - Hover: the overlay is click-through, so it gets no mouse messages. A coalescable
-  250 ms timer compares the cursor position with the panel. The RAM card's process list
+  timer compares the cursor position with the panel, every 700 ms while the cursor is
+  far away and every 200 ms within 150 px of the panel. The RAM card's process list
   is one `NtQuerySystemInformation` read when it opens and every 3 s while it stays
   open; nothing is read or kept while it is closed.
 
@@ -269,6 +270,8 @@ Measured cost on this PC (2026-10-29, Python 3.12, 3840x1600 at 100%):
 | Whole tray, 15 min idle at 30 min uptime, overlay on, vs the old code at the same uptime | 0.44% vs 0.45% of one core; 61.6 vs 63.4 MB working set; 43.7 vs 40.2 MB private |
 | One overlay repaint | 0.27 ms |
 | One rig probe of 30 ports | about 7 ms wall clock, bounded by the 50 ms timeout |
+| Hover timer, cursor away from the panel (2026-10-30, 2x5 min on vs off) | +163M cycles per 5 min, about 0.018% of one core; 1.4 ticks a second |
+| RAM card process read, only while the card is open | 15 ms per read, every 3 s: about 0.5% of one core while open, 0 while closed |
 | Device firmware | +160 B RAM, +2.2 KB flash |
 
 ---
