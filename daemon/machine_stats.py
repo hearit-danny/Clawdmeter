@@ -17,6 +17,7 @@ import ctypes
 import os
 import select
 import socket
+import struct
 import sys
 import threading
 from typing import Callable, NamedTuple
@@ -27,10 +28,11 @@ PROBE_TIMEOUT_S = 0.05
 
 # Folders rigs.mjs (~/.claude/bin/rigs.mjs) scans. The primary checkout's
 # worktrees come from its .git/worktrees/*/gitdir files instead of
-# `git worktree list`, so discovery spawns no process.
+# `git worktree list`, so discovery spawns no process. The primary checkout's
+# own stack (5432/8080/5173) is not a rig: only stack.env stacks are listed.
 MAIN_REPO = r"C:\Users\DannyHearit\RiderProjects\mniis"
 RIG_BASES = (r"C:\Users\DannyHearit\RiderProjects", r"C:\wt")
-PRIMARY_RIG = ("main", (5432, 8080, 5173))
+PORT_KEYS = (("db", "MIIC_DB_PORT"), ("api", "MIIC_BACKEND_PORT"), ("web", "MIIC_FRONTEND_PORT"))
 
 MAX_RIGS = 8
 RIG_NAME_LEN = 8
@@ -42,7 +44,8 @@ class Snapshot(NamedTuple):
     cpu: int                 # 0-100, all cores
     ram_free_gb: float       # one decimal
     ram_used_pct: int        # 0-100
-    rigs: tuple              # ((name, state), ...) up first, then partial, then down
+    rigs: tuple              # ((name, state, ((label, port, open), ...)), ...)
+                             # up first, then partial, then down
 
 
 # ---------------------------------------------------------------------------
@@ -136,12 +139,12 @@ def _port(v: dict, key: str) -> int | None:
     return p if 0 < p < 65536 else None
 
 
-def rig_from_env(v: dict) -> tuple[str, tuple[int, ...]] | None:
+def rig_from_env(v: dict) -> tuple[str, tuple[tuple[str, int], ...]] | None:
+    """(name, (("db", 5968), ("api", 18968), ("web", 5768))) with absent ports left out."""
     project = v.get("MIIC_COMPOSE_PROJECT") or v.get("MIIC_DB_CONTAINER")
     if not project:
         return None
-    ports = tuple(p for p in (_port(v, "MIIC_DB_PORT"), _port(v, "MIIC_BACKEND_PORT"),
-                              _port(v, "MIIC_FRONTEND_PORT")) if p)
+    ports = tuple((label, p) for label, key in PORT_KEYS if (p := _port(v, key)))
     return rig_name(project), ports
 
 
@@ -168,8 +171,8 @@ def _worktree_dirs(main_repo: str, bases: tuple[str, ...]) -> list[str]:
 
 
 def discover_rigs(main_repo: str = MAIN_REPO, bases: tuple[str, ...] = RIG_BASES) -> list:
-    """[(name, ports)] for the primary stack plus every stack.env, one per name."""
-    rigs = {PRIMARY_RIG[0]: PRIMARY_RIG[1]}
+    """[(name, ((label, port), ...))] for every stack.env, one per name."""
+    rigs = {}
     seen = set()
     for d in _worktree_dirs(main_repo, bases):
         key = os.path.normcase(os.path.normpath(d))
@@ -228,8 +231,11 @@ _ORDER = {RIG_UP: 0, RIG_PARTIAL: 1, RIG_DOWN: 2}
 
 
 def probe_rigs(rigs: list, probe: Callable[[list], set] = open_ports) -> tuple:
-    listening = probe([p for _, ports in rigs for p in ports])
-    states = [(name, rig_state(ports, listening)) for name, ports in rigs]
+    """((name, state, ((label, port, open), ...)), ...) sorted up, partial, down."""
+    listening = probe([p for _, ports in rigs for _, p in ports])
+    states = [(name, rig_state(tuple(p for _, p in ports), listening),
+               tuple((label, p, p in listening) for label, p in ports))
+              for name, ports in rigs]
     states.sort(key=lambda r: (_ORDER[r[1]], r[0]))
     return tuple(states)
 
@@ -246,8 +252,86 @@ def payload_fields(snap: Snapshot | None) -> dict:
         "cpu": snap.cpu,
         "rf": snap.ram_free_gb,
         "rp": snap.ram_used_pct,
-        "rg": [[n, s] for n, s in snap.rigs[:MAX_RIGS]],
+        "rg": [[r[0], r[1]] for r in snap.rigs[:MAX_RIGS]],
     }
+
+
+# ---------------------------------------------------------------------------
+# What uses RAM (on demand only)
+# ---------------------------------------------------------------------------
+# One NtQuerySystemInformation(SystemProcessInformation) snapshot per call, the
+# call Task Manager uses: no per-process handle, nothing kept between calls.
+# The overlay calls it only while the RAM half of the panel is hovered.
+
+_SYSTEM_PROCESS_INFORMATION = 5
+_STATUS_INFO_LENGTH_MISMATCH = -1073741820   # 0xC0000004 as NTSTATUS
+# SYSTEM_PROCESS_INFORMATION on 64-bit Windows: NextEntryOffset @0x00,
+# WorkingSetPrivateSize @0x08, ImageName.Length @0x38, ImageName.Buffer @0x40,
+# UniqueProcessId @0x50.
+_SPI = struct.Struct("<I4xQ40xH6xQ8xQ")
+
+
+def parse_process_info(buf: bytes, base: int) -> list[tuple[str, int]]:
+    """[(image name, private working set bytes)] from a SystemProcessInformation buffer.
+
+    `base` is the buffer's address: image names point into the same buffer.
+    The idle process (pid 0) has no name and is left out.
+    """
+    out = []
+    off = 0
+    while off + _SPI.size <= len(buf):
+        nxt, private, name_len, name_ptr, pid = _SPI.unpack_from(buf, off)
+        start = name_ptr - base
+        if pid and 0 <= start and start + name_len <= len(buf):
+            out.append((buf[start:start + name_len].decode("utf-16-le", "replace"), private))
+        if not nxt:
+            break
+        off += nxt
+    return out
+
+
+def top_memory(procs: list[tuple[str, int]], n: int = 6) -> list[tuple[str, int, int]]:
+    """[(name, bytes, process count)] grouped by image name, largest first."""
+    groups: dict[str, list] = {}
+    for name, size in procs:
+        if name.lower().endswith(".exe"):
+            name = name[:-4]
+        g = groups.setdefault(name.lower(), [name, 0, 0])
+        g[1] += size
+        g[2] += 1
+    ranked = sorted(groups.values(), key=lambda g: -g[1])
+    return [tuple(g) for g in ranked[:n]]
+
+
+def process_memory() -> list[tuple[str, int]]:
+    if sys.platform != "win32" or struct.calcsize("P") != 8:
+        return []
+    query = ctypes.windll.ntdll.NtQuerySystemInformation
+    query.restype = ctypes.c_long
+    size = 1 << 19
+    for _ in range(4):
+        buf = ctypes.create_string_buffer(size)
+        need = ctypes.c_ulong()
+        status = query(_SYSTEM_PROCESS_INFORMATION, buf, size, ctypes.byref(need))
+        if status == _STATUS_INFO_LENGTH_MISMATCH:
+            size = need.value + (1 << 16)
+            continue
+        if status < 0:
+            return []
+        return parse_process_info(buf.raw[:need.value], ctypes.addressof(buf))
+    return []
+
+
+def memory_detail(n: int = 6) -> tuple[float, float, list] | None:
+    """(used GB, total GB, top_memory list), or None off Windows."""
+    if sys.platform != "win32":
+        return None
+    ms = _MEMORYSTATUSEX()
+    ms.dwLength = ctypes.sizeof(ms)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+        return None
+    used = (ms.ullTotalPhys - ms.ullAvailPhys) / 2**30
+    return round(used, 1), round(ms.ullTotalPhys / 2**30, 1), top_memory(process_memory(), n)
 
 
 # ---------------------------------------------------------------------------

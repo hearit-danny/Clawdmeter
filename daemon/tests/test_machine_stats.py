@@ -7,6 +7,7 @@ OS without touching the machine or the network.
 Run: python -m pytest daemon/tests/test_machine_stats.py -x -q
 """
 import socket
+import struct
 
 from daemon import machine_stats as m
 
@@ -66,9 +67,10 @@ def test_parse_stack_env_crlf_reads_like_lf():
 
 
 def test_rig_from_env_strips_prefix_and_keeps_present_ports():
-    assert m.rig_from_env(m.parse_stack_env(STACK_ENV)) == ("inv1", (5968, 18968, 5768))
+    assert m.rig_from_env(m.parse_stack_env(STACK_ENV)) == (
+        "inv1", (("db", 5968), ("api", 18968), ("web", 5768)))
     db_only = m.parse_stack_env("MIIC_COMPOSE_PROJECT=mniis-1751\r\nMIIC_DB_PORT=5751\r\n")
-    assert m.rig_from_env(db_only) == ("1751", (5751,))
+    assert m.rig_from_env(db_only) == ("1751", (("db", 5751),))
 
 
 def test_rig_from_env_falls_back_to_container_and_ignores_bad_ports():
@@ -98,10 +100,9 @@ def test_discover_rigs_reads_worktrees_and_bases(tmp_path):
     (base / "dup" / "stack.env").write_text("MIIC_COMPOSE_PROJECT=mniis-b\nMIIC_DB_PORT=6003\n")
     (base / "noenv").mkdir()
     rigs = dict(m.discover_rigs(str(main), (str(base), str(tmp_path / "missing"))))
-    assert rigs["main"] == (5432, 8080, 5173)
-    assert rigs["a"] == (6001,)
-    assert rigs["b"] in ((6002,), (6003,))   # one entry per name
-    assert len(rigs) == 3
+    assert rigs["a"] == (("db", 6001),)
+    assert rigs["b"] in ((("db", 6002),), (("db", 6003),))   # one entry per name
+    assert len(rigs) == 2   # the primary checkout's own stack is not a rig
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +118,11 @@ def test_rig_state_up_partial_down():
 
 
 def test_probe_rigs_sorts_up_partial_down():
-    rigs = [("z", (1,)), ("down", (9,)), ("part", (1, 9)), ("a", (2,))]
+    rigs = [("z", (("db", 1),)), ("down", (("db", 9),)),
+            ("part", (("db", 1), ("api", 9))), ("a", (("db", 2),))]
     out = m.probe_rigs(rigs, probe=lambda ports: {1, 2})
-    assert out == (("a", 1), ("z", 1), ("part", 2), ("down", 0))
+    assert [r[:2] for r in out] == [("a", 1), ("z", 1), ("part", 2), ("down", 0)]
+    assert out[2][2] == (("db", 1, True), ("api", 9, False))
 
 
 def test_open_ports_sees_a_real_listener():
@@ -157,7 +160,7 @@ def _sampler(times, mem=lambda: (8.0, 75), rigs=(("inv1", 1),), rig_s=60.0):
         return rigs
 
     s = m.MachineSampler(sample_s=5.0, rig_s=rig_s, times=_Clock(times), mem=mem,
-                         discover=lambda: [("inv1", (1,))], probe=probe)
+                         discover=lambda: [("inv1", (("db", 1),))], probe=probe)
     return s, calls
 
 
@@ -213,6 +216,49 @@ def test_payload_fields_shape_and_cap():
 
 def test_payload_fields_none_is_empty():
     assert m.payload_fields(None) == {}
+
+
+def test_payload_fields_sends_name_and_state_only():
+    snap = m.Snapshot(1, 2.0, 3, (("inv1", 1, (("db", 1, True),)),))
+    assert m.payload_fields(snap)["rg"] == [["inv1", 1]]
+
+
+# ---------------------------------------------------------------------------
+# What uses RAM
+# ---------------------------------------------------------------------------
+
+def _spi_entry(next_off, private, name_len, name_ptr, pid, size=256):
+    head = m._SPI.pack(next_off, private, name_len, name_ptr, pid)
+    return head + b"\0" * (size - len(head))
+
+
+def test_parse_process_info_reads_names_from_the_same_buffer():
+    base = 0x10000
+    names = "chrome.exe".encode("utf-16-le") + "Code.exe".encode("utf-16-le")
+    idle = _spi_entry(256, 0, 0, 0, 0)
+    chrome = _spi_entry(256, 3 << 20, 20, base + 768, 1234)
+    code = _spi_entry(0, 5 << 20, 16, base + 788, 99)
+    buf = idle + chrome + code + names
+    assert m.parse_process_info(buf, base) == [("chrome.exe", 3 << 20), ("Code.exe", 5 << 20)]
+
+
+def test_parse_process_info_skips_names_outside_the_buffer():
+    buf = _spi_entry(0, 1, 8, 0xDEAD0000, 7)
+    assert m.parse_process_info(buf, 0x1000) == []
+
+
+def test_top_memory_groups_by_name_and_ranks():
+    procs = [("chrome.exe", 300), ("Code.exe", 500), ("chrome.exe", 400), ("System", 10)]
+    assert m.top_memory(procs, 2) == [("chrome", 700, 2), ("Code", 500, 1)]
+
+
+def test_memory_detail_live_on_windows():
+    import sys
+    if sys.platform != "win32":
+        pytest.skip("Windows only")
+    used, total, top = m.memory_detail()
+    assert 0 < used < total
+    assert top and all(size > 0 for _, size, _ in top)
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +362,8 @@ from daemon import overlay_windows as ov
 
 
 def test_rig_line_names_up_and_partial_and_counts_down():
-    rigs = (("inv1", 1), ("main", 2), ("ci1", 0), ("t1", 0))
-    assert ov.rig_line(rigs) == "inv1 up \u00b7 main partial \u00b7 2 down"
+    rigs = (("inv1", 1), ("g1", 2, (("db", 1, True),)), ("ci1", 0), ("t1", 0))
+    assert ov.rig_line(rigs) == "inv1 up \u00b7 g1 partial \u00b7 2 down"
 
 
 def test_rig_line_empty():
@@ -330,6 +376,52 @@ def test_overlay_content_equal_for_equal_snapshots():
     assert ov.content(a) != ov.content(a._replace(cpu=38))
     assert ov.content(a)[0] == "CPU 37%" and ov.content(a)[2] == "RAM 14.2 GB free"
     assert ov.content(None) is None
+
+
+def test_overlay_content_changes_with_the_open_card():
+    a = m.Snapshot(37, 14.2, 56, (("inv1", 1),))
+    assert ov.content(a) != ov.content(a, (("title", "x"),))
+
+
+def test_rig_card_lists_every_rig_with_ports():
+    rigs = (("inv1", 1, (("db", 1, True), ("api", 2, True))), ("ci1", 0, (("db", 3, False),)))
+    card = ov.rig_card(rigs)
+    assert card[0][0] == "title"
+    assert card[1] == ("rig", "inv1", 1, (("db", 1, True), ("api", 2, True)))
+    assert card[2] == ("rig", "ci1", 0, (("db", 3, False),))
+    assert ov.rig_card(())[0] == ("title", "No stack.env rigs found")
+
+
+def test_rig_card_caps_rows():
+    rigs = tuple((f"r{i}", 0, ()) for i in range(ov.MAX_CARD_RIGS + 3))
+    card = ov.rig_card(rigs)
+    assert len(card) == ov.MAX_CARD_RIGS + 2
+    assert card[-1] == ("more", "+3 more")
+
+
+def test_ram_card_rows():
+    card = ov.ram_card((21.8, 31.5, [("claude", 4 << 30, 30), ("MsMpEng", 443 << 20, 1)]))
+    assert card[0] == ("title", "In use 21.8 of 31.5 GB \u00b7 largest apps")
+    assert card[1] == ("proc", "claude (30)", "4.0 GB")
+    assert card[2] == ("proc", "MsMpEng", "443 MB")
+    assert ov.ram_card(None)[0][0] == "title"
+
+
+def test_hover_region_maps_panel_parts():
+    # window 280x150 at (1000, 500), panel is the bottom 50 px, top row 27 px
+    rect, size = (1000, 500, 1280, 650), (280, 150)
+    hit = lambda x, y: ov.hover_region((x, y), rect, size, 50, 27)
+    assert hit(999, 640) is None and hit(1100, 650) is None
+    assert hit(1100, 550) == "card"
+    assert hit(1050, 610) == "cpu"
+    assert hit(1200, 610) == "ram"
+    assert hit(1200, 640) == "rigs"
+
+
+def test_hover_region_scales_when_rect_and_bitmap_differ():
+    # a DPI-virtualized rect at half the bitmap size still maps to the same parts
+    hit = lambda x, y: ov.hover_region((x, y), (0, 0, 140, 25), (280, 50), 50, 27)
+    assert hit(100, 5) == "ram" and hit(10, 5) == "cpu" and hit(10, 20) == "rigs"
 
 
 def test_overlay_pct_color_thresholds():
